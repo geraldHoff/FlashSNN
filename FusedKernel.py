@@ -293,3 +293,21 @@ def sdsa2_fused_forward(S: torch.Tensor,
         out[:, h, :, :] = out_h
 
     return out
+
+def sdsa2_reference(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+    """
+    Pure-PyTorch reference for SDSA2.
+    out = Q @ (K^T @ V)   per (batch, head)
+    """
+    N, H, L, Cph = Q.shape
+    Q_flat = Q.flatten(0, 1)    # [N*H, L, Cph]
+    K_flat = K.flatten(0, 1)
+    V_flat = V.flatten(0, 1)
+ 
+    KtV = torch.bmm(
+        K_flat.transpose(1, 2),   # [N*H, Cph, L]
+        V_flat                    # [N*H, L, Cph]
+    )  # [N*H, Cph, Cph]
+ 
+    out_flat = torch.bmm(Q_flat, KtV)  # [N*H, L, Cph]
+    return out_flat.reshape(N, H, L, Cph)
