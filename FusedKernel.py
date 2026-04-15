@@ -13,6 +13,7 @@
 import triton
 
 @triton.jit
+import triton.language as tl
 def _sdsa2_forward_kernel(
     q_ptr, k_ptr, v_ptr, out_ptr,
     L: tl.constexpr,      # Sequence length
