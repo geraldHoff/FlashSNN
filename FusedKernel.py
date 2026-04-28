@@ -91,7 +91,7 @@ def _sdsa2_kernel(
 # Python wrapper
 # --------------------------------------------------------------------------
  
-def sdsa2_lif_hadamard_forward(
+def sdsa2_forward(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -140,7 +140,7 @@ def sdsa2_lif_hadamard_forward(
  
     grid = (N * H,)
  
-    _sdsa2_lif_hadamard_kernel[grid](
+    _sdsa2_kernel[grid](
         Q_flat, K_flat, V_flat, out_flat,
         u_flat,
         tau, V_th,
@@ -154,7 +154,7 @@ import torch
  
  
 # --------------------------------------------------------------------------
-# SDSA v2 + LIF baseline (pure PyTorch, no Triton)
+# Naive SDSA v2 baseline (pure PyTorch, no Triton)
 #
 #uses einsum to express each operation semantically:
 #
