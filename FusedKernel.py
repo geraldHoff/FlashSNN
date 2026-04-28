@@ -4,33 +4,11 @@ import triton
 import triton.language as tl
 
 
-# --------------------------------------------------------------------------
-# Kernel 1: attention with LIF membrane on KtV
-#
-# Computes KtV = K^T @ V  →  [Cph, Cph] per (batch, head),
-# then applies a Leaky Integrate-and-Fire neuron with persistent
-# membrane potential across timesteps:
-#
-#     u = τ · u_prev + KtV
-#     spike = (u > V_th)
-#     u = u · (1 - spike)          (hard reset)
-#
-# The spiked KtV (binary) is then used as:  Out = Q @ spike(KtV)
-#
-# Memory layout for the membrane:
-#   - Shape [N, H, Cph, Cph], stored in HBM, persisted across launches.
-#   - Each program (one per batch×head) loads its [Cph, Cph] slice once
-#     before the LIF update and stores it once after.  The membrane sits
-#     in registers between load and store — no extra global traffic
-#     during the L-loop or Q-loop.
-#
-# One program per (batch, head).
-# --------------------------------------------------------------------------
- 
+
 @triton.jit
-def _sdsa2_lif_forward_kernel(
+def _sdsa2_kernel(
     Q_ptr, K_ptr, V_ptr, Out_ptr,
-    U_ktv_ptr,                          # membrane state [N*H, Cph, Cph]
+    U_ktv_ptr,                          # membrane state [N*H, Cph]
     tau,                                # leak factor (scalar)
     V_th,                               # firing threshold (scalar)
     L: tl.constexpr,
@@ -47,86 +25,73 @@ def _sdsa2_lif_forward_kernel(
     q_base = Q_ptr + bh * stride_bh
     out_base = Out_ptr + bh * stride_bh
  
-    # Membrane base: each (batch, head) owns a [Cph, Cph] block
-    u_base = U_ktv_ptr + bh * Cph * Cph
+    # Membrane base: each (batch, head) owns a [Cph] vector
+    u_base = U_ktv_ptr + bh * Cph
  
-    # ---- Phase 1: accumulate KtV = K^T @ V over all L-tiles ----
+    cph_offs = tl.arange(0, BLOCK_Cph)
+    cph_mask = cph_offs < Cph
  
-    KtV = tl.zeros((BLOCK_Cph, BLOCK_Cph), dtype=dtype)
+    # ---- Phase 1: ktv_acc = Σ_L(K ⊙ V) ----
+    # Accumulate per-channel co-occurrence counts across all L-tiles.
+    # The result is a [BLOCK_Cph] vector
+ 
+    ktv_acc = tl.zeros((BLOCK_Cph,), dtype=dtype)
  
     for l_start in tl.static_range(0, L, BLOCK_L):
-        k_ptrs = tl.make_block_ptr(
-            k_base,
-            shape=(Cph, L), strides=(1, Cph),
-            offsets=(0, l_start),
-            block_shape=(BLOCK_Cph, BLOCK_L), order=(1, 0),
-        )
-        k_block = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero")
+        l_offs = l_start + tl.arange(0, BLOCK_L)
+        mask = (l_offs[:, None] < L) & (cph_offs[None, :] < Cph)
  
-        v_ptrs = tl.make_block_ptr(
-            v_base,
-            shape=(L, Cph), strides=(Cph, 1),
-            offsets=(l_start, 0),
-            block_shape=(BLOCK_L, BLOCK_Cph), order=(1, 0),
-        )
-        v_block = tl.load(v_ptrs, boundary_check=(0, 1), padding_option="zero")
+        k_ptrs = k_base + l_offs[:, None] * Cph + cph_offs[None, :]
+        v_ptrs = v_base + l_offs[:, None] * Cph + cph_offs[None, :]
  
-        KtV = tl.dot(k_block, v_block, acc=KtV,
-                      input_precision="ieee", out_dtype=dtype)
+        k_tile = tl.load(k_ptrs, mask=mask, other=0.0).to(dtype)
+        v_tile = tl.load(v_ptrs, mask=mask, other=0.0).to(dtype)
  
-    # ---- LIF update on the accumulated KtV ----
-    #
-    # Single load from HBM → registers, update, single store back.
+        # Hadamard product + reduce over L dimension | column wise dot product reduction
+        kv_prod = k_tile * v_tile                   # [BLOCK_L, BLOCK_Cph]
+        ktv_acc += tl.sum(kv_prod, axis=0)          # [BLOCK_Cph]
+ 
+    # ---- LIF update on the [Cph] aggregation vector ----
+    # Single [Cph] load from HBM → registers, update, single store back.
     # The spiked result stays in registers for Phase 2.
  
-    u_ptrs = tl.make_block_ptr(
-        u_base,
-        shape=(Cph, Cph), strides=(Cph, 1),
-        offsets=(0, 0),
-        block_shape=(BLOCK_Cph, BLOCK_Cph), order=(1, 0),
-    )
-    u_mem = tl.load(u_ptrs, boundary_check=(0, 1), padding_option="zero").to(dtype)
+    u_ptrs = u_base + cph_offs
+    u_mem = tl.load(u_ptrs, mask=cph_mask, other=0.0).to(dtype)
  
-    # Leaky integrate: decay old potential, add new input
-    u_mem = tau * u_mem + KtV
+    # Leaky integrate
+    u_mem = tau * u_mem + ktv_acc
  
-    # Fire: threshold comparison → binary spike matrix
-    ktv_spike = (u_mem > V_th).to(dtype)
+    # Fire
+    spike = (u_mem > V_th).to(dtype)
  
-    # Hard reset: zero out membrane where a spike occurred
-    u_mem = u_mem * (1.0 - ktv_spike)
+    # Hard reset
+    u_mem = u_mem * (1.0 - spike)
  
-    # Persist updated membrane to HBM for the next timestep
-    tl.store(u_ptrs, u_mem, boundary_check=(0, 1))
+    # Persist updated membrane to HBM
+    tl.store(u_ptrs, u_mem, mask=cph_mask)
  
-    # ---- Phase 2: Out = Q @ spike(KtV) for each L-tile ----
+    # ---- Phase 2: out = Q * spike (broadcast multiply) ----
+    # spike is [BLOCK_Cph], broadcast across every row of each Q tile.
+    # element-wise multiplication.
  
     for q_start in tl.static_range(0, L, BLOCK_L):
-        q_ptrs = tl.make_block_ptr(
-            q_base,
-            shape=(L, Cph), strides=(Cph, 1),
-            offsets=(q_start, 0),
-            block_shape=(BLOCK_L, BLOCK_Cph), order=(1, 0),
-        )
-        q_block = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+        q_offs = q_start + tl.arange(0, BLOCK_L)
+        mask = (q_offs[:, None] < L) & (cph_offs[None, :] < Cph)
  
-        out_tile = tl.dot(q_block, ktv_spike,
-                          input_precision="ieee", out_dtype=dtype)
+        q_ptrs = q_base + q_offs[:, None] * Cph + cph_offs[None, :]
+        q_tile = tl.load(q_ptrs, mask=mask, other=0.0).to(dtype)
  
-        out_ptrs = tl.make_block_ptr(
-            out_base,
-            shape=(L, Cph), strides=(Cph, 1),
-            offsets=(q_start, 0),
-            block_shape=(BLOCK_L, BLOCK_Cph), order=(1, 0),
-        )
-        tl.store(out_ptrs, out_tile, boundary_check=(0, 1))
+        out_tile = q_tile * spike[None, :]          # broadcast [BLOCK_L, BLOCK_Cph]
+ 
+        out_ptrs = out_base + q_offs[:, None] * Cph + cph_offs[None, :]
+        tl.store(out_ptrs, out_tile, mask=mask)
  
  
 # --------------------------------------------------------------------------
 # Python wrapper
 # --------------------------------------------------------------------------
  
-def sdsa2_lif_forward(
+def sdsa2_lif_hadamard_forward(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -137,30 +102,30 @@ def sdsa2_lif_forward(
     BLOCK_Cph: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    SDSA v2 forward with LIF membrane on the KtV aggregation.
+    SDSA2 w/ LIF
  
     Args:
         Q, K, V:  [N, H, L, Cph]  pre-spiked binary inputs.
-        u_ktv:    [N, H, Cph, Cph] membrane state, or None to zero-init.
+        u_ktv:    [N, H, Cph] membrane state, or None to zero-init.
                   Mutated in-place; pass the returned tensor back on the
                   next timestep.
         tau:      Membrane leak factor (0 = no memory, 1 = perfect memory).
         V_th:     Firing threshold.
  
     Returns:
-        out:      [N, H, L, Cph]   attention output.
-        u_ktv:    [N, H, Cph, Cph] updated membrane (same object, mutated).
+        out:      [N, H, L, Cph]  attention output.
+        u_ktv:    [N, H, Cph]     updated membrane (same object, mutated).
     """
     assert Q.shape == K.shape == V.shape
     assert Q.is_cuda and Q.is_contiguous()
     N, H, L, Cph = Q.shape
  
-    # Allocate or validate membrane state
+    # Allocate or validate membrane state, [N, H, Cph]
     if u_ktv is None:
-        u_ktv = torch.zeros(N, H, Cph, Cph, dtype=Q.dtype, device=Q.device)
+        u_ktv = torch.zeros(N, H, Cph, dtype=Q.dtype, device=Q.device)
     else:
-        assert u_ktv.shape == (N, H, Cph, Cph), (
-            f"Expected membrane shape {(N, H, Cph, Cph)}, got {u_ktv.shape}"
+        assert u_ktv.shape == (N, H, Cph), (
+            f"Expected membrane shape {(N, H, Cph)}, got {u_ktv.shape}"
         )
         u_ktv = u_ktv.contiguous()
  
@@ -171,11 +136,11 @@ def sdsa2_lif_forward(
     K_flat = K.reshape(N * H, L, Cph)
     V_flat = V.reshape(N * H, L, Cph)
     out_flat = out.reshape(N * H, L, Cph)
-    u_flat = u_ktv.reshape(N * H, Cph, Cph)
+    u_flat = u_ktv.reshape(N * H, Cph)
  
     grid = (N * H,)
  
-    _sdsa2_lif_forward_kernel[grid](
+    _sdsa2_lif_hadamard_kernel[grid](
         Q_flat, K_flat, V_flat, out_flat,
         u_flat,
         tau, V_th,
@@ -185,13 +150,29 @@ def sdsa2_lif_forward(
     )
     return out, u_ktv
 
-
-
+import torch
+ 
+ 
 # --------------------------------------------------------------------------
-# Reference implementation (pure PyTorch, for validation)
+# SDSA v2 + LIF baseline (pure PyTorch, no Triton)
+#
+#uses einsum to express each operation semantically:
+#
+#   1. ktv = einsum('nhlc,nhlc->nhc')  vector-wise dot product [N,H,Cph]
+#   2. u = τ·u_prev + ktv              leaky integrate         [N,H,Cph]
+#   3. spike = (u > V_th)              fire                    [N,H,Cph]
+#   4. u = u · (1 - spike)             hard reset              [N,H,Cph]
+#   5. out = einsum('nhlc,nhc->nhlc')  broadcast multiply      [N,H,L,Cph]
+#
+# vector-wise dot product + broadcast.  Each einsum is the intended operation 
+# without decomposing into separate element-wise + reduction steps.
+# Doesn't tile or do inter-operation fusion.
+#
+# The LIF membrane is [N, H, Cph].
 # --------------------------------------------------------------------------
  
-def sdsa2_lif_reference(
+ 
+def sdsa2_lif_hadamard_baseline(
     Q: torch.Tensor,
     K: torch.Tensor,
     V: torch.Tensor,
@@ -200,26 +181,44 @@ def sdsa2_lif_reference(
     V_th: float = 0.5,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Reference LIF-gated SDSA v2.
-    Q, K, V: [N, H, L, Cph] binary.
-    u_ktv:   [N, H, Cph, Cph] membrane or None.
+    Paper-faithful SDSA v2 + LIF.
+ 
+    Args:
+        Q, K, V:  [N, H, L, Cph]  pre-spiked binary inputs.
+        u_ktv:    [N, H, Cph] membrane state, or None to zero-init.
+                  NOTE: this is a vector, not a matrix — the paper's
+                  Hadamard-reduce produces a [Cph] aggregation, not
+                  [Cph, Cph].
+        tau:      Membrane leak factor.
+        V_th:     Firing threshold.
+ 
+    Returns:
+        out:      [N, H, L, Cph]  attention output.
+        u_ktv:    [N, H, Cph]     updated membrane.
     """
     N, H, L, Cph = Q.shape
  
     if u_ktv is None:
-        u_ktv = torch.zeros(N, H, Cph, Cph, dtype=Q.dtype, device=Q.device)
+        u_ktv = torch.zeros(N, H, Cph, dtype=Q.dtype, device=Q.device)
     else:
-        u_ktv = u_ktv.clone()       # don't mutate caller's tensor
+        u_ktv = u_ktv.clone()
  
-    # K^T @ V:  [N, H, Cph, L] @ [N, H, L, Cph] → [N, H, Cph, Cph]
-    KtV = torch.einsum("nhlc,nhld->nhcd", K, V)
+    # Step 1: vector-wise dot product  Σ_L(K ⊙ V)  →  [N, H, Cph]
+    #         contracts over L per channel in a single fused op
+    ktv = torch.einsum('nhlc,nhlc->nhc', K, V)
  
-    # LIF update
-    u_ktv = tau * u_ktv + KtV
-    spike = (u_ktv > V_th).float()
-    u_ktv = u_ktv * (1.0 - spike)      # hard reset
+    # Step 2: leaky integrate
+    u_ktv = tau * u_ktv + ktv
  
-    # Out = Q @ spike(KtV):  [N, H, L, Cph] @ [N, H, Cph, Cph]
-    out = torch.einsum("nhlc,nhcd->nhld", Q, spike)
+    # Step 3: fire
+    spike = (u_ktv > V_th).to(Q.dtype)
+ 
+    # Step 4: hard reset
+    u_ktv = u_ktv * (1.0 - spike)
+ 
+    # Step 5: broadcast element-wise multiply  Q ⊗ spike  →  [N, H, L, Cph]
+    #         spike [N,H,Cph] broadcast across L positions of Q [N,H,L,Cph]
+    out = torch.einsum('nhlc,nhc->nhlc', Q, spike)
  
     return out, u_ktv
+
